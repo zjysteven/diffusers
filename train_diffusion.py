@@ -52,10 +52,15 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-from diffusers.pipelines.diffusion.pipeline_diffusion import DiffusionPipeline
+from src.diffusers.pipelines.diffusion.pipeline_diffusion import DiffusionPipeline
 
 if is_wandb_available():
     import wandb
+    
+import json
+from PIL import Image
+from datasets import Dataset
+import datasets
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -513,6 +518,38 @@ def parse_args():
 
     return args
 
+def load_custom_dataset(root_dir, image_size=64):
+    """Load dataset from original structure using HuggingFace datasets"""
+    
+    # Walk through the labels directory and collect data
+    data_dict = {"image": [], "text": []}
+    labels_dir = Path(root_dir) / 'labels'
+    
+    print("Collecting dataset items...")
+    for sub_idx in os.listdir(labels_dir):
+        sub_dir = labels_dir / sub_idx
+        if not sub_dir.is_dir():
+            continue
+            
+        for json_file in sub_dir.glob('*.json'):
+            with open(json_file) as f:
+                data = json.load(f)
+            
+            img_base = json_file.stem
+            img_dir = Path(root_dir) / 'images' / sub_idx / f'{image_size}x{image_size}'
+            
+            for obj in data.get("objects", []):
+                obj_id = obj["id"]
+                obj_suffix = obj_id.split('_')[1]
+                img_path = img_dir / f"{img_base}_{obj_suffix}_{image_size}.jpg"
+                
+                if img_path.exists():
+                    data_dict["image"].append(str(img_path))
+                    data_dict["text"].append(obj["label"])
+    
+    # Create dataset
+    dataset = Dataset.from_dict(data_dict)
+    return dataset
 
 def main():
     args = parse_args()
@@ -617,6 +654,10 @@ def main():
     unet_config["in_channels"] = 3
     unet_config["out_channels"] = 3
     unet_config["sample_size"] = args.resolution
+    
+        
+    unet.conv_in = torch.nn.Conv2d(3, 320, kernel_size=(3, 3), padding=(1, 1))
+    unet.conv_out = torch.nn.Conv2d(320, 3, kernel_size=(3, 3), padding=(1, 1))
 
     # Freeze vae and text_encoder and set unet to trainable
     # vae.requires_grad_(False)
@@ -736,14 +777,12 @@ def main():
             data_dir=args.train_data_dir,
         )
     else:
-        data_files = {}
         if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
+            # Load dataset from original directory structure
+            train_dataset = load_custom_dataset(args.train_data_dir, args.resolution)
+            dataset = {"train": train_dataset}
+        else:
+            raise ValueError("Need either dataset_name or train_data_dir")
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
@@ -801,7 +840,7 @@ def main():
     )
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
+        images = [Image.open(image_path).convert("RGB") for image_path in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
@@ -869,7 +908,7 @@ def main():
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    vae.to(accelerator.device, dtype=weight_dtype)
+    # vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
